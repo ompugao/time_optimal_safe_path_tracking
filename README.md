@@ -87,6 +87,37 @@ The paper reports 0.25 s for N = 500, M = 30 on the GPU, and at least 1 s for se
 An "emergency decision" means no stopping route passed the Eq. 7 check, so the robot brakes to
 the nearest stage where it can stop. The robot was still stationary at every contact.
 
+## Fast stoppable sets
+
+The stoppable sets `K[j, i]` need one one-step set `Q_i(K[j, i+1])` for every pair `j > i`, which is O(N²) small LPs.
+For N = 500 on the UR5e path, they now take 0.12 s on one CPU process. My first version took 6.4 s, so this is about 50x faster.
+For reference, the paper reports 0.20 s with 16 processes, on different hardware.
+Three changes give the speed-up (`src/tospt/stoppable_sets.py`, `src/tospt/lp2d.py`):
+
+1. **Sweep over `i` once, vectorized over `j`.** `K[j, i]` depends only on `K[j, i+1]`. So instead of one backward pass per `j`,
+   a single loop runs over `i = N-1 … 0` and computes `K[:, i]` for all `j > i` in one numpy batch.
+   Only N sequential steps remain.
+
+2. **Solve each distinct target interval once.** Far from `j`, the sets stop changing, so many `j` share the same `K[j, i+1]`.
+   `np.unique` finds the distinct intervals, and the results are copied back to all `j`.
+
+3. **Reuse the stage polygon, and solve only on two lines (the main gain).**
+   `Q_i([lo, hi])` is the x-range of the convex polygon `Ω_i = {(u, x) | a u + b x <= c, 0 <= x <= x_max}` cut by the strip
+   `lo <= x + 2Δ u <= hi`. The minimum and maximum of x lie at a vertex of this cut polygon. Each such vertex is either
+   - a vertex of `Ω_i` that lies inside the strip, or
+   - a point on one of the two strip lines `x + 2Δ u = lo` or `x + 2Δ u = hi`.
+
+   `Ω_i` does not depend on `j`. So its vertices are computed once per stage, and for each interval we only test whether they lie in the strip.
+   On a strip line, substitute `u = (h − x) / (2Δ)`. Every row then becomes a bound on x alone, so the x-range on the line is a 1-D LP.
+   It is solved with the same branch-free min/max solver as the Time-to-Reach step.
+
+   Before this change, the code enumerated vertices of the full cut polygon for every interval: all row pairs (O(R²))
+   with an O(R) feasibility check each, so O(R³) per interval (R ≈ 28 rows for 6 joints). Now each interval costs
+   O(R) for the two lines plus O(V) for the vertex test (V = number of vertices of `Ω_i`).
+
+`tests/test_stoppable_sets.py` checks the result against `scipy.optimize.linprog`, the closed-form braking distance of the 1-D car,
+and the nesting property of Theorem 1.
+
 ## Notes on the paper
 
 These are my readings of places where the text is ambiguous. Please check them against the original implementation.
@@ -111,8 +142,8 @@ These are my readings of places where the text is ambiguous. Please check them a
 - **Baseline.** The Zanchettin et al. (2016) article was not accessible. `experiments/zanchettin.py` rebuilds it from the
   paper's description: the next velocity is maximized, with hard acceleration limits and `T_s (v + v_human) <= d − d_min`.
   A stop-at-goal bound was added so the car ends at 25 m.
-- **Stoppable sets.** One sweep over `i` is vectorized over all `j`, and each distinct target interval is solved once.
-  The paper instead uses one backward pass per `j` over 16 processes.
+- **Stoppable sets.** They are computed in one vectorized sweep instead of one backward pass per `j` over 16 processes
+  (see [Fast stoppable sets](#fast-stoppable-sets)).
 - **Robot scene.** UR5e (MuJoCo Menagerie) with its own capsule collision geoms, instead of OpenRAVE with enclosing spheres.
   The path is a toppra spline through two configurations and a lifted midpoint; the paper used Bi-RRT with a parabolic smoother.
   The robot is driven kinematically.
