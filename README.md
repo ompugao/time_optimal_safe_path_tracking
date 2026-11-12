@@ -1,0 +1,122 @@
+# Time-optimal safe path tracking (reproduction)
+
+A from-scratch reproduction of
+S. Fujii and Q.-C. Pham, *Time-Optimal Path Tracking with ISO Safety Guarantees*, IROS 2023
+([arXiv:2306.05197](https://arxiv.org/abs/2306.05197)).
+
+The robot tracks a fixed path as fast as its joint limits allow, but chooses each control
+so that it can always be at rest before any obstacle (moving at most `v_max`) can reach it.
+If a collision happens, the robot is stationary (ISO/TS 15066 speed and separation monitoring).
+
+## Setup
+
+```sh
+uv sync
+./scripts/fetch_assets.sh      # UR5e model from MuJoCo Menagerie (only for the robot experiment)
+uv run pytest
+```
+
+Torch comes from the CUDA 12.8 wheel index (needed for Blackwell GPUs). Every torch function
+also runs with `device="cpu"`.
+
+## Layout
+
+| file | content |
+|---|---|
+| `src/tospt/constraints.py` | per-stage `a u + b x <= c` from toppra joint velocity/acceleration constraints |
+| `src/tospt/lp2d.py` | one-step sets `Q_i` (2-variable LP) |
+| `src/tospt/stoppable_sets.py` | stoppable sets `K[j, i]` |
+| `src/tospt/lp1d.py` | branch-free 1-D LP (paper Sec. III-C) |
+| `src/tospt/time_to_reach.py` | Time-to-Reach `tau[j, i, k]` and next index `rho` (Alg. 1); serial and torch |
+| `src/tospt/controller.py` | Time-to-Arrive (Eq. 6), stop-stage selection (Eq. 7), greedy step, path follower |
+| `src/tospt/mujoco_scene.py` | UR5e scene, distances to its collision capsules |
+| `experiments/car_1d.py`, `zanchettin.py` | Exp. 1: 1-D car vs. Zanchettin-style controller |
+| `experiments/bench_precompute.py` | Exp. 2: serial vs. GPU pre-computation |
+| `experiments/robot_6dof.py` | Exp. 3: UR5e in MuJoCo with 1 or 6 obstacles at 1.6 m/s |
+
+## Running the experiments
+
+```sh
+uv run python experiments/car_1d.py                     # -> results/car_1d.png
+uv run python experiments/car_1d.py --sweep-stopping-time
+uv run python experiments/bench_precompute.py           # -> results/bench_precompute.png (~2 min)
+uv run python experiments/robot_6dof.py --obstacles 1   # add --viewer to watch in MuJoCo
+uv run python experiments/robot_6dof.py --obstacles 6
+uv run python experiments/robot_6dof.py --precompute-trials 20
+```
+
+## Results
+
+Hardware: NVIDIA RTX 5080 Laptop GPU. The paper used a GTX 1080 Ti (Exp. 2) and an RTX 2060 Max-Q (Exp. 3).
+
+### Exp. 1: 1-D car (goal 25 m, 20 m/s, 100 m/s², wall 20 m/s, `d_protective = 0`)
+
+| | paper | reproduced |
+|---|---|---|
+| ours stops at contact with max deceleration | yes | yes (speed 0 while touching) |
+| ours reaches the goal first | yes | 2.82 s vs. 3.58 s (`T_s = 0.55 s`) |
+| smallest feasible stopping time `T_s` of the baseline | 0.55 s | 0.40 s (= `(v_max + v_wall) / a_max`) |
+| bang-bang spikes when following the wall | yes | yes |
+
+### Exp. 2: Time-to-Reach computation (random 6-DoF paths, 10 trials)
+
+| setting | serial | torch CUDA float64 |
+|---|---|---|
+| N = 300, M = 50 | 1.01 s | 0.052 s |
+| N = 500, M = 50 | 2.16 s | 0.142 s |
+
+The paper reports 0.25 s for N = 500, M = 30 on the GPU, and at least 1 s for serial.
+
+### Exp. 3: UR5e, N = 513 stages, ±20 rad/s², ±π rad/s, 20 s runs, control period 4 ms
+
+| | paper | reproduced |
+|---|---|---|
+| total pre-computation, 20 paths, serial | 4.03 ± 1.01 s | 4.93 ± 1.23 s |
+| total pre-computation, 20 paths, GPU | 0.40 ± 0.09 s | 0.21 ± 0.01 s |
+| stoppable sets | 0.20 ± 0.04 s (16 processes) | 0.12 s (1 process) |
+| execution phase per cycle | within 6 ms | M = 30: max 5.1–6.7 ms, mean 0.9–1.5 ms; M = 100: max up to 9.8 ms |
+| joint speed whenever distance <= 0 | 0 | 0 (all runs) |
+
+| obstacles | M | legs done in 20 s | cycles in contact | emergency decisions |
+|---|---|---|---|---|
+| 0 | 30 | 31 (= exact TOPP-RA time, 0.64 s per leg) | 0 | 0 |
+| 1 | 30 | 24 | 159 | 1 |
+| 6 | 30 | 10 | 818 | 38 |
+| 6 | 100 | 12 | 701 | 27 |
+
+An "emergency decision" means no stopping route passed the Eq. 7 check, so the robot brakes to
+the nearest stage where it can stop. The robot was still stationary at every contact.
+
+## Notes on the paper
+
+These are my readings of places where the text is ambiguous. Please check them against the original implementation.
+
+1. **Alg. 1, line `K_{j,N} := {0}`.** Read as `K_{j,j} := {0}`, with the backward loop starting at `i = j - 1`.
+2. **1-D LP (Eq. after "forward pass").** It uses `x_k = (k δv)^2` (as in Alg. 1), not `k δv`. The target set is `K_{j,i+1}`, not `K_{j,i}`.
+3. **Eq. 7.** It is written as `τ_{j,i,k} − τ_{j,l,m} < ψ_j` for all `l`. That reduces to `τ_{j,i,k} < ψ_j` and ignores obstacles near
+   intermediate poses, so this code uses `ψ_l` per stage (`rule="per_stage"`). The literal form is available as `rule="literal"`.
+4. **Floor on ρ.** When one stage adds less than `δv` of speed, the grid route keeps the same index and cannot speed up.
+   Then τ overestimates. Example: for the UR5e path with M = 30, τ from rest is 2.64 s, while exact TOPP-RA gives 0.64 s.
+   This is conservative (later stops), not unsafe, but it lowers productivity when obstacles are near.
+   It needs `δv` smaller than about `a Δ / v`, so a finer path grid needs a finer velocity grid.
+5. **Rounding in floor/ceil.** Velocities exactly on the grid need a small tolerance. Without it, on GPU the top velocity index
+   was dropped at some stages, and τ = inf spread back along the whole velocity-limit plateau.
+6. **Stop at stage N − 1 is a dead end.** With `u` constant per segment, going from rest to rest over one segment takes infinite time.
+   So the controller never chooses N − 1 as a stop.
+7. **Scaling of Exp. 2.** The paper says time grows linearly in N and quadratically in M. Here the serial time grows about as N²
+   and about linearly in M, which matches the O(N² M) count of 1-D LPs.
+
+## Deviations from the paper
+
+- **Baseline.** The Zanchettin et al. (2016) article was not accessible. `experiments/zanchettin.py` rebuilds it from the
+  paper's description: the next velocity is maximized, with hard acceleration limits and `T_s (v + v_human) <= d − d_min`.
+  A stop-at-goal bound was added so the car ends at 25 m.
+- **Stoppable sets.** One sweep over `i` is vectorized over all `j`, and each distinct target interval is solved once.
+  The paper instead uses one backward pass per `j` over 16 processes.
+- **Robot scene.** UR5e (MuJoCo Menagerie) with its own capsule collision geoms, instead of OpenRAVE with enclosing spheres.
+  The path is a toppra spline through two configurations and a lifted midpoint; the paper used Bi-RRT with a parabolic smoother.
+  The robot is driven kinematically.
+- **Latency.** Each control decision holds for one path segment, so obstacle data can be up to one control period old.
+  This latency is subtracted from Time-to-Arrive.
+- **Execution phase.** The batched GPU version of the stop-stage selection is not implemented. The CPU version is
+  already within the paper's time budget, because route tracing stops after the last stage that could fail.
