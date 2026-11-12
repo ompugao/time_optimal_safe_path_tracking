@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from tospt.lp1d import max_u_numpy
+from tospt.time_to_reach import floor_index
 
 PER_STAGE = "per_stage"
 LITERAL = "literal"
@@ -41,34 +42,46 @@ class SafePathController:
         self.rule = rule
         self.n = sc.num_stages
 
+    def in_stoppable_set(self, j, i, x):
+        lo, hi = self.K[j, i, 0], self.K[j, i, 1]
+        return (lo - SET_TOL * (1 + lo) <= x) & (x <= hi + SET_TOL * (1 + hi))
+
     def stoppable_stages(self, i, x):
         js = np.arange(i, self.n + 1)
-        lo, hi = self.K[js, i, 0], self.K[js, i, 1]
-        inside = (lo - SET_TOL * (1 + lo) <= x) & (x <= hi + SET_TOL * (1 + hi))
-        return js[inside]
+        return js[self.in_stoppable_set(js, i, x)]
 
     def select_stop_stage(self, i, x, psi):
         """Farthest j whose fastest stopping route passes every stage before obstacles can reach it (Eq. 7).
 
-        Returns None when no route is safe.
+        Returns None when no route is safe. Stage n - 1 is never chosen: with
+        u constant per segment, a rest-to-rest move over the single last segment
+        needs infinite time, so a stop there could never finish the path.
         """
         candidates = self.stoppable_stages(i, x)
-        candidates = candidates[candidates > i]
+        candidates = candidates[(candidates > i) & (candidates != self.n - 1)]
         stationary = x <= SET_TOL
         fallback = i if stationary else None
         if len(candidates) == 0 or psi[i] <= 0.0:
             return fallback
-        k = np.full(len(candidates), min(math.floor(math.sqrt(x) / self.ttr.dv), self.ttr.num_velocities - 1))
+        top_index = floor_index(np.sqrt(self.K[candidates, i, 1]), self.ttr.dv).astype(int)
+        k = np.minimum(min(int(floor_index(math.sqrt(x), self.ttr.dv)), self.ttr.num_velocities - 1), top_index)
         start_time = self.ttr.tau[candidates, i, k]
         safe = np.isfinite(start_time)
         if self.rule == LITERAL:
             safe &= start_time < psi[candidates]
-        else:
-            for l in range(i + 1, candidates.max() + 1):
+        elif safe.any():
+            latest_arrival = start_time[safe].max()
+            can_fail = np.flatnonzero(psi[i + 1 : candidates.max() + 1] <= latest_arrival) + i + 1
+            last = can_fail.max() if len(can_fail) else i
+            can_fail_mask = np.zeros(self.n + 1, dtype=bool)
+            can_fail_mask[can_fail] = True
+            for l in range(i + 1, last + 1):
                 active = safe & (candidates >= l)
                 if not active.any():
                     break
                 k = np.where(active, self.ttr.rho[candidates, l - 1, k], k)
+                if not can_fail_mask[l]:
+                    continue
                 with np.errstate(invalid="ignore"):
                     arrival = start_time - self.ttr.tau[candidates, l, k]
                 safe &= ~active | (arrival < psi[l])
@@ -98,6 +111,28 @@ class SafePathController:
             candidates = self.stoppable_stages(i, x)
             stop = int(candidates.min()) if len(candidates) else self.n
         return Decision(self.greedy_control(i, x, stop), stop, emergency)
+
+
+class CycleDecider:
+    """Selects the stop stage once per control cycle, then follows the greedy
+    TOPP-RA forward pass inside that stoppable set for the rest of the cycle."""
+
+    def __init__(self, controller):
+        self.controller = controller
+        self.psi = None
+        self.stop = None
+
+    def begin_cycle(self, psi):
+        self.psi = psi
+        self.stop = None
+
+    def __call__(self, i, x):
+        controller = self.controller
+        if self.stop is not None and self.stop > i and controller.in_stoppable_set(self.stop, i, x):
+            return Decision(controller.greedy_control(i, x, self.stop), self.stop, emergency=False)
+        decision = controller.decide(i, x, self.psi)
+        self.stop = decision.stop_stage
+        return decision
 
 
 class PathFollower:

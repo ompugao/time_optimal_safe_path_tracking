@@ -8,6 +8,9 @@ from tospt.paths import random_joint_path, straight_line_path, uniform_gridpoint
 from tospt.stoppable_sets import compute_stoppable_sets
 from tospt.time_to_reach import time_to_reach_serial, time_to_reach_torch
 
+torch = pytest.importorskip("torch")
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
 
 def car_problem(num_stages=200, length=25.0):
     path = straight_line_path(length)
@@ -80,7 +83,34 @@ def test_unreachable_grid_states_have_infinite_time():
     assert np.isinf(ttr.tau[j, j - 1, 10]) and top_speed**2 > K[j, j - 1, 1]
 
 
-@pytest.mark.parametrize("problem", [car_problem, robot_problem])
+def plateau_problem():
+    """Path of the 6-DoF experiment, where the velocity limit is active over many stages
+    and sqrt(K)/dv lands just below the top index at some of them."""
+    import toppra as ta
+
+    from tospt.paths import joint_space_path
+
+    q_a = np.array([-0.6, -1.2, 1.6, -1.9, -1.57, 0.0])
+    q_b = np.array([0.9, -1.2, 1.6, -1.9, -1.57, 0.0])
+    lift = np.array([0.0, -0.4, 0.0, 0.0, 0.0, 0.0])
+    path = joint_space_path([q_a, 0.5 * (q_a + q_b) + lift, q_b])
+    gridpoints = ta.interpolator.propose_gridpoints(path, min_nb_points=500)
+    sc = joint_limit_constraints(path, gridpoints, np.full(6, np.pi), np.full(6, 20.0))
+    return sc, compute_stoppable_sets(sc)
+
+
+@pytest.mark.parametrize("backend", ["serial", "cpu", pytest.param("cuda", marks=requires_cuda)])
+def test_top_grid_velocity_is_usable_wherever_the_set_reaches_it(backend):
+    sc, K = plateau_problem()
+    M = 30
+    ttr = time_to_reach_serial(sc, K, M) if backend == "serial" else time_to_reach_torch(sc, K, M, device=backend)
+    j = sc.num_stages
+    top = np.isclose(np.sqrt(K[j, :j, 1]), M * ttr.dv, rtol=1e-12)
+    assert top.sum() > 100
+    assert np.all(np.isfinite(ttr.tau[j, :j, M][top]))
+
+
+@pytest.mark.parametrize("problem", [car_problem, robot_problem, plateau_problem])
 def test_torch_backend_matches_serial(problem):
     sc, K = problem()
     expected = time_to_reach_serial(sc, K, num_velocity_steps=12)

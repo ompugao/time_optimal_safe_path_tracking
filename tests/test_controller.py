@@ -65,6 +65,18 @@ def test_car_without_obstacles_reaches_the_goal_at_nearly_bang_bang_time(car):
     assert arrival == pytest.approx(1.45, abs=0.02)
 
 
+def test_never_stops_one_stage_before_the_end_where_it_could_not_restart(car):
+    sc, K, ttr = car
+    controller = SafePathController(sc, K, ttr)
+    n = sc.num_stages
+    psi = np.full(n + 1, 10.0)
+    psi[n] = 0.0
+    stop = controller.select_stop_stage(n - 5, 0.0, psi)
+    assert stop == n - 2
+    free = np.full(n + 1, 10.0)
+    assert controller.decide(n - 2, 0.0, free).u > 0.0
+
+
 def test_literal_rule_ignores_obstacles_near_intermediate_stages(car):
     sc, K, ttr = car
     psi = np.full(sc.num_stages + 1, 10.0)

@@ -28,10 +28,26 @@ def velocity_resolution(K, num_velocity_steps):
     return math.sqrt(np.nanmax(K[-1, :, 1])) / num_velocity_steps
 
 
+INDEX_TOL = 1e-9
+
+
+def floor_index(v, dv):
+    """floor(v / dv), tolerant to rounding so a velocity exactly on the grid keeps its index.
+
+    Without the tolerance, a set whose bound is the top grid velocity can lose
+    that grid point at some stages, and tau = inf then spreads backward.
+    """
+    return np.floor(np.asarray(v) / dv + INDEX_TOL)
+
+
+def ceil_index(v, dv):
+    return np.ceil(np.asarray(v) / dv - INDEX_TOL)
+
+
 def velocity_index_range(lo, hi, dv, num_velocity_steps):
     """Grid indices inside [lo, hi]; ceil/floor keep them inside the set."""
-    low = math.ceil(math.sqrt(lo) / dv)
-    high = min(math.floor(math.sqrt(hi) / dv), num_velocity_steps)
+    low = int(ceil_index(math.sqrt(lo), dv))
+    high = min(int(floor_index(math.sqrt(hi), dv)), num_velocity_steps)
     return low, high
 
 
@@ -84,7 +100,7 @@ def _greedy_steps(a, b, c, delta, lo_cur, hi_cur, lo_next, hi_next, dv, M):
         v_next = math.sqrt(min(max(x + two_delta * u, lo_next), hi_next))
         if v_next + v <= 0.0:
             continue
-        r = min(math.floor(v_next / dv), M)
+        r = min(int(floor_index(v_next, dv)), M)
         steps.append((k, two_delta / (v_next + v), r))
     return steps
 
@@ -123,14 +139,14 @@ def time_to_reach_torch(sc, K, num_velocity_steps, device="cuda", dtype=None, st
         hi_next = Kt[:, I + 1, 1][..., None]
         beta = torch.minimum(beta_s[None], (hi_next - xk) / td)
         alpha = torch.maximum(alpha_s[None], (lo_next - xk) / td)
-        low = torch.ceil(torch.sqrt(Kt[:, I, 0]) / dv)[..., None]
-        high = torch.floor(torch.sqrt(Kt[:, I, 1]) / dv)[..., None]
+        low = torch.ceil(torch.sqrt(Kt[:, I, 0]) / dv - INDEX_TOL)[..., None]
+        high = torch.floor(torch.sqrt(Kt[:, I, 1]) / dv + INDEX_TOL)[..., None]
         in_grid = (ks >= low) & (ks <= high) & (stop_stages[:, None, None] > I[None, :, None])
         v_next = torch.sqrt(torch.minimum(torch.maximum(xk + td * beta, lo_next), hi_next))
         speed_sum = v_next + vk
         ok = in_grid & zero_ok[None] & is_feasible(alpha, beta, True) & (speed_sum > 0)
         travel_time[:, I] = torch.where(ok, td / speed_sum, math.inf)
-        next_index[:, I] = torch.where(ok, torch.clamp(torch.floor(v_next / dv), 0, M).long(), 0)
+        next_index[:, I] = torch.where(ok, torch.clamp(torch.floor(v_next / dv + INDEX_TOL), 0, M).long(), 0)
         valid[:, I] = ok
 
     tau = torch.full((n + 1, n + 1, M + 1), math.inf, dtype=dtype, device=device)
