@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from tospt.constraints import joint_limit_constraints
-from tospt.controller import PathFollower, SafePathController, time_to_arrive
+from tospt.controller import CycleDecider, PathFollower, SafePathController, time_to_arrive
 from tospt.paths import straight_line_path, uniform_gridpoints
 from tospt.stoppable_sets import compute_stoppable_sets
 from tospt.time_to_reach import time_to_reach_torch
@@ -52,15 +52,15 @@ def run(num_stages, num_velocity_steps, stopping_time, duration, device):
     sc = joint_limit_constraints(path, uniform_gridpoints(path, num_stages), [VMAX], [AMAX])
     K = compute_stoppable_sets(sc)
     ttr = time_to_reach_torch(sc, K, num_velocity_steps, device=device)
-    controller = SafePathController(sc, K, ttr)
+    decider = CycleDecider(SafePathController(sc, K, ttr))
     ours = PathFollower(sc.gridpoints)
     theirs = ZanchettinCar(VMAX, AMAX, GOAL, stopping_time, human_speed=WALL_SPEED)
     wall = Wall()
     rows = []
     for step in range(int(duration / DT)):
         t = step * DT
-        psi = time_to_arrive((wall.position - sc.gridpoints)[:, None], [WALL_SPEED], latency=DT)
-        ours.step(DT, lambda i, x: controller.decide(i, x, psi))
+        decider.begin_cycle(time_to_arrive((wall.position - sc.gridpoints)[:, None], [WALL_SPEED]))
+        ours.step(DT, decider)
         theirs.step(wall.position - theirs.position, DT)
         s, v, a = ours.position_velocity_acceleration()
         wall.step(t + DT, max(s, theirs.position))

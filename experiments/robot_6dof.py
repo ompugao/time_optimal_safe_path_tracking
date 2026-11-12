@@ -134,7 +134,7 @@ def run(args):
         plan = plans[leg]
         start = time.perf_counter()
         stage_distances = point_to_capsules_distance(plan.stage_segments, robot.radii, obstacles.pos, OBSTACLE_RADIUS)
-        psi = time_to_arrive(stage_distances, OBSTACLE_SPEED, args.protective_distance, latency=DT)
+        psi = time_to_arrive(stage_distances, OBSTACLE_SPEED, args.protective_distance)
         decider.begin_cycle(psi)
         decisions = follower.step(DT, decider)
         cycle_times.append(time.perf_counter() - start)
@@ -145,8 +145,9 @@ def run(args):
         qd = dq * sd
         qdd = dq * sdd + plan.path(s, 2) * sd * sd
         distance = point_to_capsules_distance(robot.segments(q), robot.radii, obstacles.pos, OBSTACLE_RADIUS).min(initial=np.inf)
-        emergency = any(d.emergency for d in decisions)
-        rows.append(np.concatenate([[(step + 1) * DT, distance, emergency], q, qd, qdd]))
+        emergency = sum(d.emergency for d in decisions)
+        kept = sum(d.kept_previous for d in decisions)
+        rows.append(np.concatenate([[(step + 1) * DT, distance, emergency, kept], q, qd, qdd]))
         obstacles.step(DT)
 
         if follower.at_end:
@@ -165,14 +166,15 @@ def run(args):
 
 
 def report(log, cycle_times, legs_done, protective_distance):
-    t, distance, emergency = log[:, 0], log[:, 1], log[:, 2]
-    qd, qdd = log[:, 9:15], log[:, 15:21]
+    t, distance, emergency, kept = log[:, 0], log[:, 1], log[:, 2], log[:, 3]
+    qd, qdd = log[:, 10:16], log[:, 16:22]
     speed = np.abs(qd).max(axis=1)
     contact = distance <= protective_distance
     print(f"legs completed: {legs_done}")
     print(f"cycles in contact (distance <= d_protective): {contact.sum()} / {len(t)}")
     print(f"max joint speed while in contact: {speed[contact].max() if contact.any() else 0.0:.2e} rad/s")
     print(f"emergency decisions: {int(emergency.sum())}")
+    print(f"kept the previously checked stop: {int(kept.sum())}")
     print(f"max |qd| / vlim = {np.max(np.abs(qd) / VLIM):.3f}, max |qdd| / alim = {np.max(np.abs(qdd) / ALIM):.3f}")
     print(f"execution phase per cycle: mean {cycle_times.mean() * 1e3:.2f} ms, p99 {np.percentile(cycle_times, 99) * 1e3:.2f} ms, max {cycle_times.max() * 1e3:.2f} ms")
 
@@ -183,7 +185,7 @@ def plot(log, path, protective_distance):
     axes[0].plot(t, log[:, 1])
     axes[0].axhline(protective_distance, color="r", lw=0.8)
     axes[0].set_ylabel("min distance [m]")
-    for ax, block, label in zip(axes[1:], (3, 9, 15), ("q [rad]", "qd [rad/s]", "qdd [rad/s²]")):
+    for ax, block, label in zip(axes[1:], (4, 10, 16), ("q [rad]", "qd [rad/s]", "qdd [rad/s²]")):
         ax.plot(t, log[:, block : block + 6])
         ax.set_ylabel(label)
     axes[-1].set_xlabel("time [s]")

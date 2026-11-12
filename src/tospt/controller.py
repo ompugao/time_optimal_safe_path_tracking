@@ -30,6 +30,7 @@ class Decision:
     u: float
     stop_stage: int
     emergency: bool
+    kept_previous: bool = False
 
 
 class SafePathController:
@@ -102,36 +103,53 @@ class SafePathController:
             u = (lo - x) / two_delta
         return float(min(max(u, (lo - x) / two_delta), (hi - x) / two_delta))
 
-    def decide(self, i, x, psi):
+    def decide(self, i, x, psi, checked_stop=None):
+        """checked_stop: stop stage that passed the safety check at an earlier decision.
+
+        If the grid check now finds no safe stop, that stage is kept while the state
+        is still inside its stoppable set. It stays safe because the robot has
+        followed the greedy pass inside that set, which is never slower than the
+        grid route that was checked (it starts at least as fast and takes the
+        largest admissible step), and both the robot and Time-to-Arrive have
+        advanced by the same elapsed time.
+        """
         if i >= self.n:
             return Decision(0.0, self.n, emergency=False)
         stop = self.select_stop_stage(i, x, psi)
-        emergency = stop is None
-        if emergency:
-            candidates = self.stoppable_stages(i, x)
-            stop = int(candidates.min()) if len(candidates) else self.n
-        return Decision(self.greedy_control(i, x, stop), stop, emergency)
+        if stop is not None:
+            return Decision(self.greedy_control(i, x, stop), stop, emergency=False)
+        if checked_stop is not None and checked_stop > i and self.in_stoppable_set(checked_stop, i, x):
+            return Decision(self.greedy_control(i, x, checked_stop), checked_stop, emergency=False, kept_previous=True)
+        candidates = self.stoppable_stages(i, x)
+        stop = int(candidates.min()) if len(candidates) else self.n
+        return Decision(self.greedy_control(i, x, stop), stop, emergency=True)
 
 
 class CycleDecider:
     """Selects the stop stage once per control cycle, then follows the greedy
-    TOPP-RA forward pass inside that stoppable set for the rest of the cycle."""
+    TOPP-RA forward pass inside that stoppable set for the rest of the cycle.
+
+    Time-to-Arrive is computed from obstacle data at the start of the cycle, so a
+    decision taken `elapsed` seconds into the cycle uses psi - elapsed.
+    """
 
     def __init__(self, controller):
         self.controller = controller
         self.psi = None
         self.stop = None
+        self.checked_stop = None
 
     def begin_cycle(self, psi):
         self.psi = psi
         self.stop = None
 
-    def __call__(self, i, x):
+    def __call__(self, i, x, elapsed=0.0):
         controller = self.controller
         if self.stop is not None and self.stop > i and controller.in_stoppable_set(self.stop, i, x):
             return Decision(controller.greedy_control(i, x, self.stop), self.stop, emergency=False)
-        decision = controller.decide(i, x, self.psi)
+        decision = controller.decide(i, x, self.psi - elapsed, checked_stop=self.checked_stop)
         self.stop = decision.stop_stage
+        self.checked_stop = None if decision.emergency else decision.stop_stage
         return decision
 
 
@@ -164,12 +182,12 @@ class PathFollower:
         return self.s_grid[self.stage] + v0 * t + 0.5 * self.u * t * t, v0 + self.u * t, self.u
 
     def step(self, dt, decide):
-        """Advance by dt; decide(stage, x) -> u is called at every stage boundary and while stationary."""
+        """Advance by dt; decide(stage, x, elapsed_in_step) is called at every stage boundary and while stationary."""
         remaining = dt
         decisions = []
         while remaining > 0.0 and not self.at_end:
             if not self.committed:
-                decision = decide(self.stage, self.x)
+                decision = decide(self.stage, self.x, dt - remaining)
                 decisions.append(decision)
                 self.u = decision.u
                 self.elapsed = 0.0

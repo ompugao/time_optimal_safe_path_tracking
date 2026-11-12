@@ -74,18 +74,45 @@ The paper reports 0.25 s for N = 500, M = 30 on the GPU, and at least 1 s for se
 | total pre-computation, 20 paths, serial | 4.03 ± 1.01 s | 4.93 ± 1.23 s |
 | total pre-computation, 20 paths, GPU | 0.40 ± 0.09 s | 0.21 ± 0.01 s |
 | stoppable sets | 0.20 ± 0.04 s (16 processes) | 0.12 s (1 process) |
-| execution phase per cycle | within 6 ms | M = 30: max 5.1–6.7 ms, mean 0.9–1.5 ms; M = 100: max up to 9.8 ms |
+| execution phase per cycle | within 6 ms | max 3.9–6.3 ms, mean 0.9–1.6 ms (with obstacles) |
 | joint speed whenever distance <= 0 | 0 | 0 (all runs) |
 
 | obstacles | M | legs done in 20 s | cycles in contact | emergency decisions |
 |---|---|---|---|---|
 | 0 | 30 | 31 (= exact TOPP-RA time, 0.64 s per leg) | 0 | 0 |
-| 1 | 30 | 24 | 159 | 1 |
-| 6 | 30 | 10 | 818 | 38 |
-| 6 | 100 | 12 | 701 | 27 |
+| 1 | 30 | 24 | 135 | 0 |
+| 1 | 100 | 24 | 130 | 0 |
+| 6 | 30 | 12 | 730 | 0 |
+| 6 | 100 | 12 | 792 | 0 |
 
-An "emergency decision" means no stopping route passed the Eq. 7 check, so the robot brakes to
-the nearest stage where it can stop. The robot was still stationary at every contact.
+An "emergency decision" means that no stopping route passes the Eq. 7 check and no previously checked stop is still valid.
+The robot then brakes to the nearest stage where it can stop, and this fallback is not checked against ψ.
+In 4 more seeds with 6 obstacles and M = 30 and 100, the count was also 0.
+For the cause of earlier emergencies, see [Timing of decisions](#timing-of-decisions).
+
+### Timing of decisions
+
+Each control decision holds for one path segment, so decisions happen at stage boundaries *inside* a control cycle.
+Time-to-Arrive ψ is computed from the obstacle positions at the start of the cycle.
+So a decision taken `e` seconds into the cycle uses `ψ − e` (`CycleDecider` in `src/tospt/controller.py`).
+
+An earlier version subtracted a fixed latency of one full cycle instead.
+That is safe for one decision, but inconsistent between decisions:
+- between two decisions in consecutive cycles, ψ is charged a full cycle of obstacle motion;
+- the robot, however, may have moved for less than one cycle.
+
+A stop that was checked at one decision could then fail at the next one by a fraction of a millisecond, while the robot
+was braking toward that stop. This produced all the emergency decisions seen before: 1 run with 1 obstacle, 38 and 27 with 6 obstacles.
+I first thought that most of them came from the floor quantization of the grid routes, but fixing the timing alone removed all of them.
+
+As a second safeguard, if the grid check finds no safe stop, the controller keeps the last stop that passed the check,
+as long as the state is still inside its stoppable set. This stays safe, because two things hold:
+- **The robot is never slower than the checked route.** It follows the greedy pass inside that set, which starts at least
+  as fast as the grid route and takes the largest admissible step at every stage.
+  This assumes that a faster state never leads to a slower next state, which holds when the stages are short.
+- **Robot and obstacle times advance together.** Both arrival times and ψ decrease by the same elapsed time.
+
+With the timing fix, this safeguard did not trigger in any run. It is covered by a unit test.
 
 ## Fast stoppable sets
 
@@ -147,7 +174,7 @@ These are my readings of places where the text is ambiguous. Please check them a
 - **Robot scene.** UR5e (MuJoCo Menagerie) with its own capsule collision geoms, instead of OpenRAVE with enclosing spheres.
   The path is a toppra spline through two configurations and a lifted midpoint; the paper used Bi-RRT with a parabolic smoother.
   The robot is driven kinematically.
-- **Latency.** Each control decision holds for one path segment, so obstacle data can be up to one control period old.
-  This latency is subtracted from Time-to-Arrive.
+- **Timing.** Decisions happen at stage boundaries within a control cycle and subtract the elapsed time from ψ.
+  If no safe stop is found, the last checked stop is kept (see [Timing of decisions](#timing-of-decisions)).
 - **Execution phase.** The batched GPU version of the stop-stage selection is not implemented. The CPU version is
   already within the paper's time budget, because route tracing stops after the last stage that could fail.
