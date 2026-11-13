@@ -48,6 +48,7 @@ uv run python experiments/robot_6dof.py --precompute-trials 20
 uv run python experiments/car_1d.py --jerk-limit 5000 --out results/car_1d_jerk.png
 uv run python experiments/robot_6dof.py --obstacles 1 --jerk-limit 1000
 uv run python experiments/car_1d_jerk.py                 # smoothed plan vs. third-order prototype
+uv run python experiments/third_order_figure.py          # -> docs/third_order_lattice.png
 ```
 
 ## Results
@@ -244,6 +245,18 @@ The joint speed is 0 in every cycle with contact, in all runs.
   that passed the Eq. 7 check stays safe without further assumptions.
 - `δu <= J Δ / v_max` is required, so that the acceleration can change by one level per stage at top speed.
 
+![Third-order lattice model](docs/third_order_lattice.png)
+
+The figure is made by `experiments/third_order_figure.py` from the real tables (250 stages, 5000 m/s³).
+
+1. **Model.** The acceleration is continuous and linear on each segment (blue). The paper's model has jumps (dashed).
+2. **Integer step.** From `(n, m)`, each choice of the next level `m'` leads to the lattice state `n' = n + m + m'`.
+3. **Last segment.** Velocity and acceleration reach 0 together at the stop stage.
+4. **Stoppable states.** Lattice states with finite `tau[j, i, ·, ·]`, for three stages `i` before the stop stage `j`.
+   They grow backward from the entry states of the last segment (black). They are sets of points, not intervals.
+5. **Fastest stop from cruise.** The stored route in time. The grey band is the last segment,
+   the dashed line is the jerk-optimal stop time.
+
 Comparison on the car (`experiments/car_1d_jerk.py`, 250 stages, CPU). The jerk-optimal stop from cruise takes `v/a + a/J`.
 
 | jerk limit | method | tables | pre-computation | arrival, no wall | arrival, wall | stop from cruise (optimal) |
@@ -260,6 +273,14 @@ Findings:
   grid point with zero acceleration, and the single constant-jerk segment over one stage takes `3Δ / v`.
   For the route above this is 77 ms (from 3.9 m/s at −100 m/s²), while a ramp at the jerk limit needs about 20 ms.
   The ramp of a jerk-optimal stop happens within the last 1–2 cm, far below the stage length of 10 cm.
+- **Very few states can enter the last segment.** Only even negative levels with `n = 1.5 |m|` qualify. In the figure
+  these are 2 of 1449 states: (3.87 m/s, −100 m/s²) and (2.74 m/s, −50 m/s²). Every stop must pass through one of them,
+  so the route has to steer the acceleration to such a state. With 100 stages and δu = 33 m/s², the fastest stop
+  goes −100 → −67 → 0, because (5.0 m/s, −67 m/s²) is the entry state it can reach.
+  A route that is only feasible, not fastest, can even oscillate (for example −100 → −40 → −80 → 0).
+- **The lattice is coarse near rest.** Speeds are `√(n Δ δu)`, so the lowest non-zero speed is `√(Δ δu)`
+  (1.58 m/s in the figure, 2.04 m/s with 100 stages). There is no slow state between rest and this speed,
+  both for stopping and for starting. The paper's model has no such gap, because `x` is continuous there.
 - **The cost grows fast.** The number of states per stage is about `v_max³ / (J Δ²)` times the number of levels,
   and there are N² stage pairs. With 250 stages and 2000 m/s³ the tables need 2.6 GB.
 - A richer last segment (constant deceleration, then a jerk ramp) would shorten the stop, but the lattice only
