@@ -29,6 +29,7 @@ also runs with `device="cpu"`.
 | `src/tospt/lp1d.py` | branch-free 1-D LP (paper Sec. III-C) |
 | `src/tospt/time_to_reach.py` | Time-to-Reach `tau[j, i, k]` and next index `rho` (Alg. 1); serial and torch |
 | `src/tospt/controller.py` | Time-to-Arrive (Eq. 6), stop-stage selection (Eq. 7), greedy step, path follower |
+| `src/tospt/jerk_filter.py` | joint jerk limits (extension, not in the paper): stage rows and moving-average follower |
 | `src/tospt/mujoco_scene.py` | UR5e scene, distances to its collision capsules |
 | `experiments/car_1d.py`, `zanchettin.py` | Exp. 1: 1-D car vs. Zanchettin-style controller |
 | `experiments/bench_precompute.py` | Exp. 2: serial vs. GPU pre-computation |
@@ -43,6 +44,8 @@ uv run python experiments/bench_precompute.py           # -> results/bench_preco
 uv run python experiments/robot_6dof.py --obstacles 1   # add --viewer to watch in MuJoCo
 uv run python experiments/robot_6dof.py --obstacles 6
 uv run python experiments/robot_6dof.py --precompute-trials 20
+uv run python experiments/car_1d.py --jerk-limit 5000 --out results/car_1d_jerk.png
+uv run python experiments/robot_6dof.py --obstacles 1 --jerk-limit 1000
 ```
 
 ## Results
@@ -144,6 +147,85 @@ Three changes give the speed-up (`src/tospt/stoppable_sets.py`, `src/tospt/lp2d.
 
 `tests/test_stoppable_sets.py` checks the result against `scipy.optimize.linprog`, the closed-form braking distance of the 1-D car,
 and the nesting property of Theorem 1.
+
+## Jerk limits
+
+This is an extension. The paper has no jerk limit: `u = s̈` is constant on each segment, so the acceleration
+jumps at every stage boundary and at every stop.
+
+### Why not inside the planner
+
+The joint jerk along the path is
+
+```
+q⃛ = q'(s) s⃛  +  3 q''(s) ṡ s̈  +  q'''(s) ṡ³
+```
+
+A bound on `s⃛` makes the acceleration a state. Then the method loses its structure:
+- the stoppable sets become 2-D sets in `(x, u)` instead of intervals;
+- in the s-domain `s⃛ = u'(s) √x`, so the constraint is not convex in `x`;
+- a stop with zero acceleration is singular in `s` (`u ∝ (s_end − s)^(1/3)`).
+
+### What is implemented
+
+The planner stays second-order. The robot executes the moving average of the planned position
+(`SmoothedFollower` in `src/tospt/jerk_filter.py`):
+
+```
+s(t) = mean of s_ref over [t − T, t]
+```
+
+Because the filter acts on the scalar `s`, three things hold exactly:
+- the robot stays on the path, and `s_ref(t − T) <= s(t) <= s_ref(t)`;
+- when the plan stops at stage `j`, the robot stops at the same stage, at most `T` later;
+- `s⃛(t) = (s̈_ref(t) − s̈_ref(t − T)) / T`, so `|s⃛| <= (u_max − u_min) / T`.
+
+**Safety.** The robot passes every stage at most `T` after the plan. So the plan is checked with `ψ − T`
+(the `latency` argument of `time_to_arrive`). Eq. 7 then gives `arrival + T < ψ` for the real robot.
+
+**Jerk budget per joint.**
+1. The terms without `s⃛` become linear stage rows: `√xmax_i · |3 q'' u + q''' x| <= G`.
+   `√x` is replaced by its stage maximum to keep the rows linear. This is only loose at low speed,
+   where these terms are small anyway. `G` is at most `geometric_share · J` (default 0.25),
+   and it is 0 on a straight path.
+2. The window bounds the first term: `T = max over stages and joints of |q'| · swing / (J − G)`,
+   where `swing` is the widest interval of admissible `u` at one stage and one velocity.
+   For the car this is `T = 2 a_max / J`, the time to swing from full acceleration to full braking.
+
+### Results
+
+1-D car (same setting as Exp. 1), `a_max = 100 m/s²`:
+
+| jerk limit [m/s³] | window T | arrival | max jerk / limit | speed while touching |
+|---|---|---|---|---|
+| none | - | 2.82 s | - | 0 |
+| 20000 | 10 ms | 2.85 s | 1.00 | 0 |
+| 5000 | 40 ms | 2.94 s | 1.00 | 0 |
+| 2000 | 100 ms | 3.13 s | 1.00 | 0 |
+
+UR5e (same setting as Exp. 3, M = 30, seed 0, `geometric_share = 0.25`). Derivatives are finite differences of
+the executed joint positions at 4 ms.
+
+| jerk limit [rad/s³] | window T | legs, 0 obs. | legs, 1 obs. | legs, 6 obs. | max jerk / limit | max acc. / limit | emergencies |
+|---|---|---|---|---|---|---|---|
+| none | - | 31 | 24 | 12 | - | 1.00 | 0 |
+| 2000 | 24 ms | 30 | 21 | 8 | 0.83 | 1.00 | 0 |
+| 1000 | 56 ms | 28 | 17 | 4 | 0.74 | 0.98 | 0 |
+| 500 | 60 ms | 23 | 10 | 1 | 0.71 | 0.70 | 0 |
+
+The joint speed is 0 in every cycle with contact, in all runs.
+
+### Limits
+
+- **Stops are later than necessary.** The delay is `T = 2a/J`. A jerk-optimal stop needs `2a/J` from full
+  acceleration, but only `a/J` from cruise. With many obstacles this latency costs much of the productivity (table above).
+- **The split is a trade-off.** A small `geometric_share` gives a short window but slows the free motion
+  (at 500 rad/s³: share 0.25 gives 23 legs with 60 ms, share 0.5 gives 25 legs with 160 ms).
+- **Limits hold up to an error of order T.** The filter averages plan states over a short piece of the path,
+  while the rows and the swing are taken per stage. In a test on random 5-waypoint paths, joint velocity and
+  acceleration exceeded their limits by 1–3 % for windows of 50–160 ms. The experiments print the measured ratios.
+- **Rows hold at grid points only**, like all other constraints here (collocation).
+- A third-order version with the acceleration as a state would remove the first two limits. It is not implemented.
 
 ## Notes on the paper
 
