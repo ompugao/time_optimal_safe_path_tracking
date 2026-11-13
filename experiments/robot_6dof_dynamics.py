@@ -94,6 +94,12 @@ def run(args):
     viewer = None
     if args.viewer:
         viewer = mujoco.viewer.launch_passive(model, data)
+    recorder = None
+    if args.record:
+        from tospt.video import VideoRecorder
+
+        recorder = VideoRecorder(model, args.record, fps=args.fps)
+        frame_interval = round(1.0 / (args.fps * DT))
     rows = []
     legs_done = 0
     for step in range(int(args.duration / DT)):
@@ -117,7 +123,10 @@ def run(args):
             obstacles.step(PHYSICS_DT)
 
         q, qd = data.qpos[:6].copy(), data.qvel[:6].copy()
-        distance = point_to_capsules_distance(robot.segments(q), robot.radii, obstacles.pos, OBSTACLE_RADIUS).min(initial=np.inf)
+        obstacle_distances = point_to_capsules_distance(robot.segments(q), robot.radii, obstacles.pos, OBSTACLE_RADIUS)[0]
+        distance = obstacle_distances.min(initial=np.inf)
+        if recorder is not None and step % frame_interval == 0:
+            recorder.capture(q, obstacles.pos, obstacle_distances, args.protective_distance)
         q_ref, qd_ref, _ = reference(plan, follower)
         reference_distance = point_to_capsules_distance(robot.segments(q_ref), robot.radii, obstacles.pos, OBSTACLE_RADIUS).min(initial=np.inf)
         rows.append(
@@ -134,6 +143,8 @@ def run(args):
                 break
             viewer.sync()
             time.sleep(max(0.0, DT - (time.perf_counter() - wall_start)))
+    if recorder is not None:
+        recorder.close()
     return np.array(rows), legs_done, actuator_torque_limits(model)
 
 
@@ -194,6 +205,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--viewer", action="store_true")
+    parser.add_argument("--record", type=Path, default=None, help="write an mp4 rendered offscreen")
+    parser.add_argument("--fps", type=int, default=25)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 

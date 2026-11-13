@@ -8,6 +8,10 @@ The robot tracks a fixed path as fast as its joint limits allow, but chooses eac
 so that it can always be at rest before any obstacle (moving at most `v_max`) can reach it.
 If a collision happens, the robot is stationary (ISO/TS 15066 speed and separation monitoring).
 
+![UR5e among 6 obstacles moving at 1.6 m/s](docs/media/robot_6dof_6obs.gif)
+
+Exp. 3 with 6 obstacles (first 8 s, real time). An obstacle turns red while it touches the robot; the robot is then at rest.
+
 ## Setup
 
 ```sh
@@ -30,6 +34,7 @@ also runs with `device="cpu"`.
 | `src/tospt/time_to_reach.py` | Time-to-Reach `tau[j, i, k]` and next index `rho` (Alg. 1); serial and torch |
 | `src/tospt/controller.py` | Time-to-Arrive (Eq. 6), stop-stage selection (Eq. 7), greedy step, path follower |
 | `src/tospt/mujoco_scene.py` | UR5e scene (optional payload), distances to its collision capsules |
+| `src/tospt/video.py` | offscreen MuJoCo rendering to mp4 (`--record`) |
 | `src/tospt/dynamics.py` | torque limits from MuJoCo inverse dynamics, torque actuators, computed-torque tracking |
 | `experiments/car_1d.py`, `zanchettin.py` | Exp. 1: 1-D car vs. Zanchettin-style controller |
 | `experiments/bench_precompute.py` | Exp. 2: serial vs. GPU pre-computation |
@@ -44,8 +49,9 @@ uv run python experiments/car_1d.py --sweep-stopping-time
 uv run python experiments/bench_precompute.py           # -> results/bench_precompute.png (~2 min)
 uv run python experiments/robot_6dof.py --obstacles 1   # add --viewer to watch in MuJoCo
 uv run python experiments/robot_6dof.py --obstacles 6
+uv run python experiments/robot_6dof.py --obstacles 6 --record results/robot_6dof_6obs.mp4   # needs ffmpeg and EGL
 uv run python experiments/robot_6dof.py --precompute-trials 20
-uv run python experiments/robot_6dof_dynamics.py --obstacles 6                      # add --viewer to watch
+uv run python experiments/robot_6dof_dynamics.py --obstacles 6                      # --viewer or --record also work
 uv run python experiments/robot_6dof_dynamics.py --obstacles 6 --actual-payload 4.0 # model error
 ```
 
@@ -127,10 +133,12 @@ Not part of the paper. `experiments/robot_6dof_dynamics.py` runs the Exp. 3 scen
   They are added to the stage constraints, so the stoppable sets and Time-to-Reach respect them too.
   The planner uses 80% of the actuator limits (150 Nm, 28 Nm); the rest is headroom for feedback.
   The joint acceleration limit is loosened to 100 rad/s², so torque is the active limit.
-  A 3 kg payload sits at the flange. Exact TOPP-RA time per leg: 0.608 s (0.510 s without the torque limits).
+  A 3 kg payload (orange) sits at the flange. Exact TOPP-RA time per leg: 0.608 s (0.510 s without the torque limits).
 - **The robot is simulated, not set.** The Menagerie position servos are replaced by torque motors.
   MuJoCo integrates the dynamics with a 1 ms step. The safe path controller decides as before at 4 ms cycles.
   The decisions are taken at stage boundaries, as in [Timing of decisions](#timing-of-decisions).
+
+![Simulated UR5e with torque limits among 6 obstacles](docs/media/robot_6dof_dynamics_6obs.gif)
 
 **Tracking.** The controller computes the torque with inverse dynamics, for the acceleration that puts `q` exactly on
 the reference after one semi-implicit Euler step (a discrete-time deadbeat law; MuJoCo's `implicitfast`

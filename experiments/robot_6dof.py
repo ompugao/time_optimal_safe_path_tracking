@@ -126,6 +126,12 @@ def run(args):
         import mujoco.viewer
 
         viewer = mujoco.viewer.launch_passive(model, data)
+    recorder = None
+    if args.record:
+        from tospt.video import VideoRecorder
+
+        recorder = VideoRecorder(model, args.record, fps=args.fps)
+        frame_interval = round(1.0 / (args.fps * DT))
     rows = []
     cycle_times = []
     legs_done = 0
@@ -144,7 +150,10 @@ def run(args):
         q = plan.path(s)
         qd = dq * sd
         qdd = dq * sdd + plan.path(s, 2) * sd * sd
-        distance = point_to_capsules_distance(robot.segments(q), robot.radii, obstacles.pos, OBSTACLE_RADIUS).min(initial=np.inf)
+        obstacle_distances = point_to_capsules_distance(robot.segments(q), robot.radii, obstacles.pos, OBSTACLE_RADIUS)[0]
+        distance = obstacle_distances.min(initial=np.inf)
+        if recorder is not None and step % frame_interval == 0:
+            recorder.capture(q, obstacles.pos, obstacle_distances, args.protective_distance)
         emergency = sum(d.emergency for d in decisions)
         kept = sum(d.kept_previous for d in decisions)
         rows.append(np.concatenate([[(step + 1) * DT, distance, emergency, kept], q, qd, qdd]))
@@ -162,6 +171,8 @@ def run(args):
             data.mocap_pos[:] = obstacles.pos
             viewer.sync()
             time.sleep(max(0.0, DT - (time.perf_counter() - wall_start)))
+    if recorder is not None:
+        recorder.close()
     return np.array(rows), np.array(cycle_times), legs_done
 
 
@@ -223,6 +234,8 @@ def main():
     parser.add_argument("--backend", default="cuda", choices=["cuda", "cpu", "serial"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--viewer", action="store_true")
+    parser.add_argument("--record", type=Path, default=None, help="write an mp4 rendered offscreen")
+    parser.add_argument("--fps", type=int, default=25)
     parser.add_argument("--precompute-trials", type=int, default=0)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
