@@ -18,7 +18,8 @@ import toppra as ta
 import toppra.algorithm as algo
 
 from tospt.constraints import joint_limit_constraints
-from tospt.controller import CycleDecider, PathFollower, SafePathController, time_to_arrive
+from tospt.controller import CycleDecider, SafePathController, time_to_arrive
+from tospt.jerk_filter import SmoothedFollower, jerk_limited_constraints, window_samples
 from tospt.mujoco_scene import CapsuleRobot, load_scene, point_to_capsules_distance
 from tospt.paths import joint_space_path
 from tospt.stoppable_sets import compute_stoppable_sets
@@ -45,16 +46,22 @@ class Plan:
     path: object
     controller: SafePathController
     stage_segments: np.ndarray
+    filter_samples: int
     time_stoppable_sets: float
     time_dp: float
     dp_estimate_from_rest: float
     toppra_duration: float
 
 
-def precompute(robot, wps, min_stages, velocity_steps, backend):
+def precompute(robot, wps, min_stages, velocity_steps, backend, jerk_limit=None, geometric_share=0.25):
     path = joint_space_path(wps)
     gridpoints = ta.interpolator.propose_gridpoints(path, min_nb_points=min_stages)
     sc = joint_limit_constraints(path, gridpoints, VLIM, ALIM)
+    filter_samples = 1
+    if jerk_limit is not None:
+        limited = jerk_limited_constraints(sc, path, np.full(6, jerk_limit), geometric_share)
+        sc = limited.sc
+        filter_samples = window_samples(limited.window, DT)
     start = time.perf_counter()
     K = compute_stoppable_sets(sc)
     time_sets = time.perf_counter() - start
@@ -74,6 +81,7 @@ def precompute(robot, wps, min_stages, velocity_steps, backend):
         path,
         SafePathController(sc, K, ttr),
         robot.segments(path(gridpoints)),
+        filter_samples,
         time_sets,
         time_dp,
         float(ttr.tau[-1, 0, 0]),
@@ -109,17 +117,21 @@ def run(args):
     model, data = load_scene(args.obstacles, OBSTACLE_RADIUS)
     robot = CapsuleRobot(model, data)
     precompute(robot, waypoints(Q_A, Q_B), 100, 10, args.backend)
-    plans = [precompute(robot, waypoints(a, b), args.stages, args.velocity_steps, args.backend) for a, b in ((Q_A, Q_B), (Q_B, Q_A))]
+    plans = [
+        precompute(robot, waypoints(a, b), args.stages, args.velocity_steps, args.backend, args.jerk_limit, args.geometric_share)
+        for a, b in ((Q_A, Q_B), (Q_B, Q_A))
+    ]
     for name, plan in zip(("A->B", "B->A"), plans):
         n = plan.controller.n
         print(
             f"plan {name}: stages={n + 1} stoppable sets={plan.time_stoppable_sets:.3f}s DP={plan.time_dp:.3f}s "
             f"time-to-reach from rest={plan.dp_estimate_from_rest:.3f}s (exact TOPP-RA {plan.toppra_duration:.3f}s)"
+            + (f" smoothing window={plan.filter_samples * DT * 1e3:.0f}ms" if args.jerk_limit is not None else "")
         )
 
     obstacles = Obstacles(rng, args.obstacles)
     leg = 0
-    follower = PathFollower(plans[leg].controller.sc.gridpoints)
+    follower = SmoothedFollower(plans[leg].controller.sc.gridpoints, plans[leg].filter_samples)
     decider = CycleDecider(plans[leg].controller)
     viewer = None
     if args.viewer:
@@ -134,14 +146,14 @@ def run(args):
         plan = plans[leg]
         start = time.perf_counter()
         stage_distances = point_to_capsules_distance(plan.stage_segments, robot.radii, obstacles.pos, OBSTACLE_RADIUS)
-        psi = time_to_arrive(stage_distances, OBSTACLE_SPEED, args.protective_distance)
+        psi = time_to_arrive(stage_distances, OBSTACLE_SPEED, args.protective_distance, latency=follower.latency(DT))
         decider.begin_cycle(psi)
         decisions = follower.step(DT, decider)
         cycle_times.append(time.perf_counter() - start)
 
-        s, sd, sdd = follower.position_velocity_acceleration()
+        s, sd, sdd = follower.reference.position_velocity_acceleration()
         dq = plan.path(s, 1)
-        q = plan.path(s)
+        q = plan.path(follower.position)
         qd = dq * sd
         qdd = dq * sdd + plan.path(s, 2) * sd * sd
         distance = point_to_capsules_distance(robot.segments(q), robot.radii, obstacles.pos, OBSTACLE_RADIUS).min(initial=np.inf)
@@ -153,7 +165,7 @@ def run(args):
         if follower.at_end:
             legs_done += 1
             leg = 1 - leg
-            follower = PathFollower(plans[leg].controller.sc.gridpoints)
+            follower = SmoothedFollower(plans[leg].controller.sc.gridpoints, plans[leg].filter_samples)
             decider = CycleDecider(plans[leg].controller)
         if viewer is not None:
             if not viewer.is_running():
@@ -162,10 +174,21 @@ def run(args):
             data.mocap_pos[:] = obstacles.pos
             viewer.sync()
             time.sleep(max(0.0, DT - (time.perf_counter() - wall_start)))
-    return np.array(rows), np.array(cycle_times), legs_done
+    log = np.array(rows)
+    return (log if args.jerk_limit is None else with_differenced_derivatives(log)), np.array(cycle_times), legs_done
 
 
-def report(log, cycle_times, legs_done, protective_distance):
+def with_differenced_derivatives(log):
+    """Replaces the reference qd, qdd by backward differences of the executed q and appends qddd (the robot starts at rest)."""
+    blocks = [log[:, :10]]
+    derivative = log[:, 4:10]
+    for _ in range(3):
+        derivative = np.diff(derivative, axis=0, prepend=derivative[:1]) / DT
+        blocks.append(derivative)
+    return np.concatenate(blocks, axis=1)
+
+
+def report(log, cycle_times, legs_done, protective_distance, jerk_limit):
     t, distance, emergency, kept = log[:, 0], log[:, 1], log[:, 2], log[:, 3]
     qd, qdd = log[:, 10:16], log[:, 16:22]
     speed = np.abs(qd).max(axis=1)
@@ -176,16 +199,19 @@ def report(log, cycle_times, legs_done, protective_distance):
     print(f"emergency decisions: {int(emergency.sum())}")
     print(f"kept the previously checked stop: {int(kept.sum())}")
     print(f"max |qd| / vlim = {np.max(np.abs(qd) / VLIM):.3f}, max |qdd| / alim = {np.max(np.abs(qdd) / ALIM):.3f}")
+    if jerk_limit is not None:
+        print(f"max |qddd| / jlim = {np.max(np.abs(log[:, 22:28])) / jerk_limit:.3f}")
     print(f"execution phase per cycle: mean {cycle_times.mean() * 1e3:.2f} ms, p99 {np.percentile(cycle_times, 99) * 1e3:.2f} ms, max {cycle_times.max() * 1e3:.2f} ms")
 
 
-def plot(log, path, protective_distance):
+def plot(log, path, protective_distance, jerk_limit):
     t = log[:, 0]
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    labels = ["q [rad]", "qd [rad/s]", "qdd [rad/s²]"] + (["qddd [rad/s³]"] if jerk_limit is not None else [])
+    fig, axes = plt.subplots(1 + len(labels), 1, figsize=(12, 2.5 * (1 + len(labels))), sharex=True)
     axes[0].plot(t, log[:, 1])
     axes[0].axhline(protective_distance, color="r", lw=0.8)
     axes[0].set_ylabel("min distance [m]")
-    for ax, block, label in zip(axes[1:], (4, 10, 16), ("q [rad]", "qd [rad/s]", "qdd [rad/s²]")):
+    for ax, block, label in zip(axes[1:], (4, 10, 16, 22), labels):
         ax.plot(t, log[:, block : block + 6])
         ax.set_ylabel(label)
     axes[-1].set_xlabel("time [s]")
@@ -224,17 +250,19 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--precompute-trials", type=int, default=0)
+    parser.add_argument("--jerk-limit", type=float, default=None, help="joint jerk limit [rad/s³], same for all joints")
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--geometric-share", type=float, default=0.25, help="largest share of the jerk limit for the terms without s_dddot")
     args = parser.parse_args()
 
     if args.precompute_trials:
         precompute_trials(args)
         return
     log, cycle_times, legs_done = run(args)
-    report(log, cycle_times, legs_done, args.protective_distance)
+    report(log, cycle_times, legs_done, args.protective_distance, args.jerk_limit)
     out = args.out or Path(f"results/robot_6dof_{args.obstacles}obs.png")
     out.parent.mkdir(parents=True, exist_ok=True)
-    plot(log, out, args.protective_distance)
+    plot(log, out, args.protective_distance, args.jerk_limit)
     print(f"saved {out}")
 
 
