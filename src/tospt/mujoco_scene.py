@@ -7,8 +7,20 @@ UR5E_SCENE = Path(__file__).resolve().parents[2] / "assets/mujoco_menagerie/univ
 COLLISION_GROUP = 3
 
 
-def load_scene(num_obstacles, obstacle_radius, scene_path=UR5E_SCENE):
+def load_scene(num_obstacles, obstacle_radius, scene_path=UR5E_SCENE, payload_mass=0.0):
     spec = mujoco.MjSpec.from_file(str(scene_path))
+    if payload_mass > 0.0:
+        flange = spec.body("wrist_3_link")
+        payload = flange.add_body(name="payload", pos=[0.0, 0.15, 0.0])
+        payload.add_geom(
+            type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+            size=[0.04, 0.02, 0],
+            mass=payload_mass,
+            group=COLLISION_GROUP,
+            rgba=[0.8, 0.4, 0.1, 1.0],
+            contype=0,
+            conaffinity=0,
+        )
     for q in range(num_obstacles):
         body = spec.worldbody.add_body(name=f"obstacle{q}", mocap=True, pos=[0.0, 0.0, -1.0])
         body.add_geom(
