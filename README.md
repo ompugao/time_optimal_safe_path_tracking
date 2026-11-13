@@ -30,6 +30,7 @@ also runs with `device="cpu"`.
 | `src/tospt/time_to_reach.py` | Time-to-Reach `tau[j, i, k]` and next index `rho` (Alg. 1); serial and torch |
 | `src/tospt/controller.py` | Time-to-Arrive (Eq. 6), stop-stage selection (Eq. 7), greedy step, path follower |
 | `src/tospt/jerk_filter.py` | joint jerk limits (extension, not in the paper): stage rows and moving-average follower |
+| `src/tospt/third_order.py` | prototype with the acceleration as a state (1-D car only) |
 | `src/tospt/mujoco_scene.py` | UR5e scene, distances to its collision capsules |
 | `experiments/car_1d.py`, `zanchettin.py` | Exp. 1: 1-D car vs. Zanchettin-style controller |
 | `experiments/bench_precompute.py` | Exp. 2: serial vs. GPU pre-computation |
@@ -46,6 +47,7 @@ uv run python experiments/robot_6dof.py --obstacles 6
 uv run python experiments/robot_6dof.py --precompute-trials 20
 uv run python experiments/car_1d.py --jerk-limit 5000 --out results/car_1d_jerk.png
 uv run python experiments/robot_6dof.py --obstacles 1 --jerk-limit 1000
+uv run python experiments/car_1d_jerk.py                 # smoothed plan vs. third-order prototype
 ```
 
 ## Results
@@ -225,7 +227,43 @@ The joint speed is 0 in every cycle with contact, in all runs.
   while the rows and the swing are taken per stage. In a test on random 5-waypoint paths, joint velocity and
   acceleration exceeded their limits by 1–3 % for windows of 50–160 ms. The experiments print the measured ratios.
 - **Rows hold at grid points only**, like all other constraints here (collocation).
-- A third-order version with the acceleration as a state would remove the first two limits. It is not implemented.
+- A third-order version with the acceleration as a state should remove the first two limits. The prototype below
+  shows that this is not easy on a grid in `s`.
+
+### Third-order prototype (1-D car only)
+
+`src/tospt/third_order.py` makes the acceleration a state, for a straight path with uniform stages.
+
+- `u = s̈` is continuous and linear in `s` on each segment. At grid points it takes values `m · δu`.
+- Then `x_{i+1} = x_i + Δ (u_i + u_{i+1})`, so `x` stays on the lattice `n · Δ · δu`.
+  The state is the integer pair `(n, m)`, and the next state is `n' = n + m + m'`. Nothing is rounded.
+- On a segment the jerk is `u'(s) · ṡ`, largest where `ṡ` is largest, so every constraint is a plain inequality (no LP).
+- Rest is an equilibrium of these segments (reached only in infinite time). So the segment into a stop and the
+  segment out of rest use constant jerk in time. This needs `u = ∓ 2x / (3Δ)` at the moving end.
+- `tau[j, i, n, m]` is an exact DP over the lattice. The controller follows the stored route exactly, so a route
+  that passed the Eq. 7 check stays safe without further assumptions.
+- `δu <= J Δ / v_max` is required, so that the acceleration can change by one level per stage at top speed.
+
+Comparison on the car (`experiments/car_1d_jerk.py`, 250 stages, CPU). The jerk-optimal stop from cruise takes `v/a + a/J`.
+
+| jerk limit | method | tables | pre-computation | arrival, no wall | arrival, wall | stop from cruise (optimal) |
+|---|---|---|---|---|---|---|
+| 5000 m/s³ | smoothed plan | 103 MB | 0.9 s | 1.489 s | 2.94 s | 241 ms (220) |
+| 5000 m/s³ | third-order | 456 MB | 1.3 s | 1.524 s | 3.04 s | 253 ms (220) |
+| 5000 m/s³ | third-order, 2x levels | 1719 MB | 18 s | 1.524 s | 3.04 s | 253 ms (220) |
+
+With 150 stages and 2000 m/s³: smoothed plan 301 ms, third-order 316 ms (282 ms with 2x levels, 824 MB), optimal 250 ms.
+Both methods keep jerk, acceleration and velocity within the limits, and the car is at rest whenever the wall touches it.
+
+Findings:
+- **The prototype is not faster than the smoothed plan.** The loss is in the last segment. A stop must end exactly at a
+  grid point with zero acceleration, and the single constant-jerk segment over one stage takes `3Δ / v`.
+  For the route above this is 77 ms (from 3.9 m/s at −100 m/s²), while a ramp at the jerk limit needs about 20 ms.
+  The ramp of a jerk-optimal stop happens within the last 1–2 cm, far below the stage length of 10 cm.
+- **The cost grows fast.** The number of states per stage is about `v_max³ / (J Δ²)` times the number of levels,
+  and there are N² stage pairs. With 250 stages and 2000 m/s³ the tables need 2.6 GB.
+- A richer last segment (constant deceleration, then a jerk ramp) would shorten the stop, but the lattice only
+  allows a few such segments per level. A real gain probably needs stop positions that are not tied to grid points.
 
 ## Notes on the paper
 
