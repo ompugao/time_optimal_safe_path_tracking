@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import toppra as ta
@@ -22,6 +22,14 @@ class StageConstraints:
     @property
     def deltas(self) -> np.ndarray:
         return np.diff(self.gridpoints)
+
+    def with_rows(self, a, b, c) -> "StageConstraints":
+        return replace(
+            self,
+            a=np.concatenate([self.a, a], axis=1),
+            b=np.concatenate([self.b, b], axis=1),
+            c=np.concatenate([self.c, c], axis=1),
+        )
 
 
 def build_stage_constraints(path, gridpoints, constraints) -> StageConstraints:
