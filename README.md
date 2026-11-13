@@ -269,10 +269,8 @@ With 150 stages and 2000 m/s³: smoothed plan 301 ms, third-order 316 ms (282 ms
 Both methods keep jerk, acceleration and velocity within the limits, and the car is at rest whenever the wall touches it.
 
 Findings:
-- **The prototype is not faster than the smoothed plan.** The loss is in the last segment. A stop must end exactly at a
-  grid point with zero acceleration, and the single constant-jerk segment over one stage takes `3Δ / v`.
-  For the route above this is 77 ms (from 3.9 m/s at −100 m/s²), while a ramp at the jerk limit needs about 20 ms.
-  The ramp of a jerk-optimal stop happens within the last 1–2 cm, far below the stage length of 10 cm.
+- **The prototype is not faster than the smoothed plan.** The loss is in the segments into and out of rest
+  (see [Why it is slower](#why-it-is-slower-than-the-smoothed-plan)).
 - **Very few states can enter the last segment.** Only even negative levels with `n = 1.5 |m|` qualify. In the figure
   these are 2 of 1449 states: (3.87 m/s, −100 m/s²) and (2.74 m/s, −50 m/s²). Every stop must pass through one of them,
   so the route has to steer the acceleration to such a state. With 100 stages and δu = 33 m/s², the fastest stop
@@ -285,6 +283,36 @@ Findings:
   and there are N² stage pairs. With 250 stages and 2000 m/s³ the tables need 2.6 GB.
 - A richer last segment (constant deceleration, then a jerk ramp) would shorten the stop, but the lattice only
   allows a few such segments per level. A real gain probably needs stop positions that are not tied to grid points.
+
+#### Why it is slower than the smoothed plan
+
+Stop from cruise at 5000 m/s³: jerk-optimal 220 ms, smoothed plan 241 ms, prototype 253 ms.
+
+Where the prototype loses its 33 ms:
+- **About 28 ms in the last segment.** A stop must end exactly at a grid point with zero velocity and zero acceleration.
+  The model does this with one constant-jerk segment over one stage (Δ = 0.1 m). Its shape is fixed:
+  it takes `3Δ / v` and has the jerk `2 v³ / (9 Δ²)`.
+  - The fastest route enters it at 3.87 m/s and −100 m/s², so it takes 77 ms.
+  - Its jerk is about 1290 m/s³, only 26 % of the limit.
+  - A jerk-optimal stop would keep −100 m/s² down to about 1 m/s (29 ms) and then ramp the acceleration to 0
+    in 20 ms: about 49 ms in total.
+- **About 5 ms at the start of braking.** The acceleration goes from 0 to −100 m/s² over 5 stages (25 ms). The optimum is `a/J` = 20 ms.
+
+Why the last segment cannot be made faster:
+- **The stage is too long.** The ramp at the jerk limit covers only about 7 mm (`J T³ / 6` with T = 20 ms).
+  The stage is 100 mm, so no profile inside it can use the full jerk.
+- **More acceleration levels do not help.** The limit comes from Δ, not from δu. With twice the levels the stop still takes 253 ms.
+- **A finer Δ is not affordable.** A stage of 7 mm means about 3750 stages, and the tables grow like `1/Δ⁵`.
+
+Why the smoothed plan is faster:
+- **It smooths in time.** The moving average acts on `s(t)`, so the grid in `s` does not limit it near the stop.
+- **Its loss is fixed and small.** The stop takes the second-order stop (200 ms) plus the window `2a/J` (40 ms).
+  That is `a/J` = 20 ms above the optimum, less than the 33 ms of the prototype.
+
+The arrival time without a wall has the same cause (1.524 s against 1.489 s, jerk-optimal about 1.47 s).
+The segment out of rest has the same fixed shape and also takes 77 ms, so the prototype loses time at both ends.
+
+So the acceleration state itself is not what makes the prototype slow. The cause is that a stop must hit a grid point in `s` exactly.
 
 ## Notes on the paper
 
