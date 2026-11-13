@@ -29,10 +29,12 @@ also runs with `device="cpu"`.
 | `src/tospt/lp1d.py` | branch-free 1-D LP (paper Sec. III-C) |
 | `src/tospt/time_to_reach.py` | Time-to-Reach `tau[j, i, k]` and next index `rho` (Alg. 1); serial and torch |
 | `src/tospt/controller.py` | Time-to-Arrive (Eq. 6), stop-stage selection (Eq. 7), greedy step, path follower |
-| `src/tospt/mujoco_scene.py` | UR5e scene, distances to its collision capsules |
+| `src/tospt/mujoco_scene.py` | UR5e scene (optional payload), distances to its collision capsules |
+| `src/tospt/dynamics.py` | torque limits from MuJoCo inverse dynamics, torque actuators, computed-torque tracking |
 | `experiments/car_1d.py`, `zanchettin.py` | Exp. 1: 1-D car vs. Zanchettin-style controller |
 | `experiments/bench_precompute.py` | Exp. 2: serial vs. GPU pre-computation |
 | `experiments/robot_6dof.py` | Exp. 3: UR5e in MuJoCo with 1 or 6 obstacles at 1.6 m/s |
+| `experiments/robot_6dof_dynamics.py` | demo: Exp. 3 with torque limits and a physically simulated robot |
 
 ## Running the experiments
 
@@ -43,6 +45,8 @@ uv run python experiments/bench_precompute.py           # -> results/bench_preco
 uv run python experiments/robot_6dof.py --obstacles 1   # add --viewer to watch in MuJoCo
 uv run python experiments/robot_6dof.py --obstacles 6
 uv run python experiments/robot_6dof.py --precompute-trials 20
+uv run python experiments/robot_6dof_dynamics.py --obstacles 6                      # add --viewer to watch
+uv run python experiments/robot_6dof_dynamics.py --obstacles 6 --actual-payload 4.0 # model error
 ```
 
 ## Results
@@ -114,6 +118,48 @@ as long as the state is still inside its stoppable set. This stays safe, because
 
 With the timing fix, this safeguard did not trigger in any run. It is covered by a unit test.
 
+## Demo with robot dynamics
+
+Not part of the paper. `experiments/robot_6dof_dynamics.py` runs the Exp. 3 scene with two changes:
+
+- **Torque limits in the path constraints.** toppra's `JointTorqueConstraint` gives rows
+  `tau(s) = m(s) u + c(s) x + g(s)`, with `m, c, g` from MuJoCo `mj_inverse` (armature included).
+  They are added to the stage constraints, so the stoppable sets and Time-to-Reach respect them too.
+  The planner uses 80% of the actuator limits (150 Nm, 28 Nm); the rest is headroom for feedback.
+  The joint acceleration limit is loosened to 100 rad/s², so torque is the active limit.
+  A 3 kg payload sits at the flange. Exact TOPP-RA time per leg: 0.608 s (0.510 s without the torque limits).
+- **The robot is simulated, not set.** The Menagerie position servos are replaced by torque motors.
+  MuJoCo integrates the dynamics with a 1 ms step. The safe path controller decides as before at 4 ms cycles.
+  The decisions are taken at stage boundaries, as in [Timing of decisions](#timing-of-decisions).
+
+**Tracking.** The controller computes the torque with inverse dynamics, for the acceleration that puts `q` exactly on
+the reference after one semi-implicit Euler step (a discrete-time deadbeat law; MuJoCo's `implicitfast`
+integrator is semi-implicit Euler here, because the joints have no damping).
+I first used inverse dynamics feedforward plus PD. The robot then lagged behind the reference.
+When the reference stopped, the robot still moved for some tens of ms to remove the last error,
+up to 0.05 rad/s while touching an obstacle. Margins fixed that, but cost all productivity
+(0 legs in 20 s with 6 obstacles). With the deadbeat law, the robot stops in the same physics step as the reference.
+
+| obstacles | model used by controller / simulated payload | legs in 20 s | max joint speed in contact | max tracking error | max torque / limit | saturated physics steps |
+|---|---|---|---|---|---|---|
+| 1 | 3 kg / 3 kg | 30 | 3e-18 rad/s | 1e-21 rad | 0.81 | 0 |
+| 6 | 3 kg / 3 kg | 17 | 4e-18 rad/s | 2e-21 rad | 0.81 | 0 |
+| 1 | 3 kg / 4 kg | 30 | 4e-6 rad/s | 2e-5 rad | 0.99 | 1 |
+| 6 | 3 kg / 4 kg | 17 | 8e-4 rad/s | 2e-5 rad | 1.00 | 98 |
+| 1 | 3 kg / 4 kg, `--settle-time 0.01` | 29 | 4e-11 rad/s | 2e-5 rad | 1.00 | 15 |
+| 6 | 3 kg / 4 kg, `--settle-time 0.01` | 14 | 5e-9 rad/s | 2e-5 rad | 1.00 | 119 |
+
+All runs: 0 emergency decisions, joint speed within the limit, no MuJoCo contacts.
+
+- With an exact model, tracking is exact to rounding, and the guarantee of the paper carries over to the simulated robot.
+- With model error (33% heavier payload), the robot needs a few ms to settle after the reference stops.
+  `--settle-time` subtracts this time from ψ, like a latency. 10 ms is enough here. `--tracking-margin` adds a distance
+  for the position error, which was not needed here (2e-5 rad).
+- The model error also uses up the 20% torque headroom, so the command saturates in some physics steps.
+- The torque chatters near obstacles, because `u` switches between segments (the bang-bang behavior the paper mentions).
+- The deadbeat law is a very high-gain feedback (1/h² = 10⁶ s⁻²). It works in simulation. On a real robot, sensor
+  noise and actuator bandwidth would need a softer tracker and correspondingly larger margins.
+
 ## Fast stoppable sets
 
 The stoppable sets `K[j, i]` need one one-step set `Q_i(K[j, i+1])` for every pair `j > i`, which is O(N²) small LPs.
@@ -173,7 +219,8 @@ These are my readings of places where the text is ambiguous. Please check them a
   (see [Fast stoppable sets](#fast-stoppable-sets)).
 - **Robot scene.** UR5e (MuJoCo Menagerie) with its own capsule collision geoms, instead of OpenRAVE with enclosing spheres.
   The path is a toppra spline through two configurations and a lifted midpoint; the paper used Bi-RRT with a parabolic smoother.
-  The robot is driven kinematically.
+  The robot is driven kinematically. `experiments/robot_6dof_dynamics.py` adds torque limits and a simulated robot
+  (see [Demo with robot dynamics](#demo-with-robot-dynamics)).
 - **Timing.** Decisions happen at stage boundaries within a control cycle and subtract the elapsed time from ψ.
   If no safe stop is found, the last checked stop is kept (see [Timing of decisions](#timing-of-decisions)).
 - **Execution phase.** The batched GPU version of the stop-stage selection is not implemented. The CPU version is
